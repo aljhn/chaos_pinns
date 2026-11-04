@@ -148,7 +148,6 @@ def train_model(
 ) -> tuple[Model, list, list]:
     key, subkey = jax.random.split(key, 2)
     model = MLP(config.input_size, config.output_size, config.hidden_size, config.num_hidden_layers, subkey)
-    # model = MLPWithNormalizedTime(model, problem.t0, problem.t1)
 
     key, subkey = jax.random.split(key, 2)
     t_val, x_val = problem.sample_validation(subkey, config.n_validation)
@@ -184,16 +183,11 @@ def train_model(
 
 
 def normalize_and_align_clvs(V: Float[Array, "time dims dims"]):
-    """Normalize each CLV and remove arbitrary sign flips between time steps."""
     norms = jnp.linalg.norm(V, axis=1, keepdims=True)
     V = V / jnp.maximum(norms, 1e-12)
 
     def align(previous, current):
-        signs = jnp.where(
-            jnp.sum(previous * current, axis=0) < 0.0,
-            -1.0,
-            1.0,
-        )
+        signs = jnp.where(jnp.sum(previous * current, axis=0) < 0.0, -1.0, 1.0)
         current = current * signs[None, :]
         return current, current
 
@@ -211,17 +205,9 @@ def train_model_clv(
     lyapunov_exponents: Float[Array, " dims"],
     clv_beta: float = 1.0,
 ) -> tuple[Model, list, list]:
-    # Initialize model.
     key, subkey = jax.random.split(key)
-    model = MLP(
-        config.input_size,
-        config.output_size,
-        config.hidden_size,
-        config.num_hidden_layers,
-        subkey,
-    )
+    model = MLP(config.input_size, config.output_size, config.hidden_size, config.num_hidden_layers, subkey)
 
-    # Validation data.
     key, subkey = jax.random.split(key)
     t_val, x_val = problem.sample_validation(subkey, config.n_validation)
 
@@ -229,81 +215,32 @@ def train_model_clv(
     trainloader = TrainLoader(t_data, x_data, config.batch_size)
     validationloader = ValidationLoader(t_val, x_val, config.batch_size)
 
-    # Collocation sampler.
     domain_boundary = jnp.array([[problem.t0, problem.t1]])
-    collocation_sampler = UniformCollocationSampler(
-        config.n_collocation,
-        domain_boundary,
-    )
+    collocation_sampler = UniformCollocationSampler(config.n_collocation, domain_boundary)
 
-    # Prepare CLVs once, outside the training loop.
     t_clv = jnp.asarray(t_clv).reshape(-1)
     V_clv = normalize_and_align_clvs(V_clv)
 
     dims = V_clv.shape[-1]
-    if V_clv.shape[1] != dims:
-        raise ValueError("Each CLV matrix must be square.")
-    if lyapunov_exponents.shape != (dims,):
-        raise ValueError("Expected one Lyapunov exponent per CLV.")
-    if dims != config.output_size:
-        raise ValueError("The CLV dimension must match the PINN's state-space residual dimension.")
 
-    # Diagnose whether the CLV-coordinate transformation is reliable.
-    condition_numbers = jnp.linalg.cond(V_clv)
-    print(
-        "CLV condition numbers:",
-        f"median={float(jnp.median(condition_numbers)):.3e},",
-        f"p99={float(jnp.percentile(condition_numbers, 99)):.3e},",
-        f"max={float(jnp.max(condition_numbers)):.3e}",
-    )
-
-    if float(jnp.max(condition_numbers)) > 1e8:
-        print(
-            "Warning: Some CLV matrices are severely ill-conditioned. "
-            "The CLV-coordinate residual may be numerically unreliable."
-        )
-
-    # Start with weak CLV weighting.
     raw_weights = jnp.exp(clv_beta * lyapunov_exponents)
-
-    # Bound the relative importance of each direction.
     raw_weights = jnp.clip(raw_weights, 0.5, 2.0)
-
-    # Normalize to mean one.
     weights = dims * raw_weights / jnp.sum(raw_weights)
     sqrt_weights = jnp.sqrt(weights)
 
-    print("Lyapunov exponents:", lyapunov_exponents)
-    print("CLV weights:", weights)
-
-    # Flatten the matrices so each component can be interpolated in time.
     V_flat = V_clv.reshape(V_clv.shape[0], dims * dims)
 
     def interpolate_clv(t):
-        interpolated = jax.vmap(
-            lambda values: jnp.interp(t, t_clv, values),
-            in_axes=1,
-        )(V_flat)
+        interpolated = jax.vmap(lambda values: jnp.interp(t, t_clv, values), in_axes=1)(V_flat)
         return interpolated.reshape(dims, dims)
 
     def physics_residual(model, positions):
-        # Standard ODE residual: (batch, dims).
-        residuals = jax.vmap(
-            problem.residual,
-            in_axes=(None, 0),
-        )(model, positions)
+        residuals = jax.vmap(problem.residual, in_axes=(None, 0))(model, positions)
 
-        # Interpolate the CLV basis at each collocation time.
         times = positions[:, 0]
         V_batch = jax.vmap(interpolate_clv)(times)
 
-        # Express residuals in CLV coordinates: V(t) a(t) = r(t).
-        coefficients = jax.vmap(
-            lambda V, r: jnp.linalg.solve(V, r),
-        )(V_batch, residuals)
-
-        # The usual mean-squared residual of this output becomes
-        # mean_t [sum_i weights[i] * coefficients[t, i]**2 / dims].
+        coefficients = jax.vmap(lambda V, r: jnp.linalg.solve(V, r))(V_batch, residuals)
         return coefficients * sqrt_weights[None, :]
 
     optimizer = optax.adamw(config.learning_rate)
@@ -367,36 +304,6 @@ def setup_plotting():
             "legend.labelcolor": text,
         }
     )
-
-
-# def plot_models(
-#     model1: Model,
-#     model2: Model,
-#     problem: InitialValueProblem,
-#     data_eval: tuple[Float[Array, "batch 1"], Float[Array, "batch 2"]],
-#     data_train: tuple[Float[Array, "batch 1"], Float[Array, "batch 2"]],
-# ) -> None:
-#     t_eval, x_eval = data_eval
-#     t_train, x_train = data_train
-#
-#     x1 = jax.vmap(model1)(t_eval)
-#     x2 = jax.vmap(model2)(t_eval)
-#
-#     print("MSE 1:", jnp.mean((x1 - x_eval) ** 2))
-#     print("MSE 2:", jnp.mean((x2 - x_eval) ** 2))
-#
-#     fig, ax = plt.subplots(figsize=(5, 3.5), constrained_layout=True)
-#     ax.plot(t_eval, x_eval[:, 0], color="black", linewidth=1, label="True")
-#     ax.scatter(t_train, x_train[:, 0], color="black", s=10)
-#     ax.plot(t_eval, x1[:, 0], linewidth=1, label="PINN")
-#     ax.plot(t_eval, x2[:, 0], linewidth=1, label="CINN")
-#     ax.set_xlabel(r"$t$")
-#     ax.set_ylabel(r"$x(t)$")
-#     ax.legend(loc="upper right")
-#     ax.margins(x=0.02, y=0.02)
-#     ax.spines["top"].set_visible(False)
-#     ax.spines["right"].set_visible(False)
-#     fig.savefig("plots/plot_8_trajectories.pdf", dpi=300, bbox_inches="tight")
 
 
 def plot_models(
