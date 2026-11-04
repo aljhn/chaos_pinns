@@ -399,6 +399,9 @@ def main():
     x0 = jnp.array([config.x0_1, config.x0_2, config.x0_3])
     system = Lorenz(x0, config.t0, config.t1, config.sigma, config.rho, config.beta)
 
+    t_all, x_all, Q_all, V_all, lyapunov_exponents = get_lyapunov_forward(config, system)
+    exit()
+
     filename = "lorenz.npz"
     path = Path(filename)
     if path.exists():
@@ -428,12 +431,8 @@ def main():
     data_train = (t_train, x_train)
 
     key = jax.random.PRNGKey(config.seed)
-    # config.epochs = 1000
     model, train_losses, validation_losses = train_model(config, system, data_train, key)
 
-    # config.learning_rate = 1e-3
-    # config.physics_weight = 1e-3
-    # config.epochs = 40000
     model_clv, train_losses_clv, validation_losses_clv = train_model_clv(
         config, system, data_train, key, t_all, Q_all, lyapunov_exponents, clv_beta=0.05
     )
